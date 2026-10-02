@@ -27,10 +27,11 @@ flowchart LR
     schemas -- "polaris-setup<br/>loop → create tables" --> polaris
 
     user -- "JSON msgs<br/>topics: events, books, authors" --> kafka
-    kafka -- "Kafka Engine<br/>{events,books,authors}_kafka" --> ch
+    kafka -- "Kafka Engine sources<br/>default.events_kafka<br/>raw_data.{books,authors}" --> ch
     ch -- "MVs<br/>INSERT via DataLakeCatalog" --> polaris
     ch -- "write Parquet + Iceberg metadata" --> rustfs
-    polaris -- "register snapshot<br/>s3://warehouse/default/{events,books,authors}/" --> rustfs
+    polaris -- "register snapshots<br/>s3://warehouse/{default,raw_data,silver}/..." --> rustfs
+    ch -- "silver MV fan-out<br/>Kafka sink" --> kafka
 
     browser -- "/" --> console
     console -. "Login with OIDC" .-> keycloak
@@ -80,16 +81,18 @@ docker compose up -d
 docker compose ps        # wait for everything to be healthy
 ```
 
-On first boot, ClickHouse automatically runs
-`clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql`, which creates:
+On first boot, ClickHouse automatically runs every file under
+[clickhouse/docker-entrypoint-initdb.d/](clickhouse/docker-entrypoint-initdb.d/)
+in filename order:
 
-- Database `polaris_catalog` (DataLakeCatalog engine → Polaris REST)
-- Kafka Engine source tables `default.{events,books,authors}_kafka`
-- Materialized views `default.{events,books,authors}_mv` wiring each Kafka topic
-  to `polaris_catalog.\`default.{events,books,authors}\``
+| File | What it creates |
+|---|---|
+| `01-polaris-catalog.sql` | `polaris_catalog` database (DataLakeCatalog → Polaris REST); Kafka Engine source `default.events_kafka` + MV landing it in `polaris_catalog.\`default.events\`` |
+| `02-book-store-raw.sql` | Kafka Engine sources `raw_data.{books,authors}` + MVs landing them in `polaris_catalog.\`raw_data.{books,authors}\`` |
+| `03-book-store-silver.sql` | Silver MV joining `raw_data.books` + `raw_data.authors` into `polaris_catalog.\`silver.books_authors\``, plus a Kafka sink MV that fan-outs the same JOIN result to the `book_authors` topic |
 
-The Iceberg target tables themselves are pre-created by `polaris-setup` from
-the JSON files in [schemas/](schemas/).
+Iceberg target tables are pre-created by `polaris-setup` from the JSON files
+in [schemas/](schemas/).
 
 ## Adding an Iceberg table
 
@@ -100,9 +103,10 @@ Three mechanical edits, no inline JSON:
 2. **Drop a schema file** — new `schemas/<name>.json` with Iceberg field
    types (`long`, `string`, `int`, `timestamp`, …). The `namespace` and `name`
    fields at the top become the Polaris namespace + table name.
-3. **Add a Kafka Engine + MV block** to
-   [clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql](clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql).
-   Column names and types must match the Iceberg schema from step 2.
+3. **Add a Kafka Engine + MV block** to one of the files under
+   [clickhouse/docker-entrypoint-initdb.d/](clickhouse/docker-entrypoint-initdb.d/)
+   (or a new numbered file). Column names and types must match the Iceberg
+   schema from step 2.
 
 ### Applying to a running stack
 
@@ -113,48 +117,108 @@ to a running stack:
 # 1. Re-run the Polaris schema loop (idempotent — unchanged schemas are no-ops)
 docker compose rm -sf polaris-setup && docker compose up -d polaris-setup
 
-# 2. Re-run the ClickHouse DDL by hand
-docker compose exec -T clickhouse clickhouse-client --multiquery \
-    < clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql
+# 2. Re-run the ClickHouse DDL by hand (every file, in order)
+for f in clickhouse/docker-entrypoint-initdb.d/*.sql; do
+  echo "--- $f ---"
+  docker compose exec -T clickhouse clickhouse-client --multiquery < "$f"
+done
 ```
 
 Both are `IF NOT EXISTS` / idempotent, so re-running is safe.
 
 ## End-to-end verification
 
+This exercises every pipeline in the stack: the simple `events` ingestion, the
+medallion pipeline (`raw_data.*` → `silver.*`), and the Kafka fan-out that
+re-publishes the silver JOIN result onto a new topic.
+
+> `-T` on `docker compose exec` disables TTY allocation so the heredoc stdin
+> works. `-it` fails with "the input device is not a TTY" because stdin is a
+> pipe.
+
+### 1. Produce test messages
+
 ```sh
-# Produce to all three topics (-T disables TTY so heredoc works)
+# authors first — the silver JOIN needs the author row to exist when the
+# book arrives (CH MVs trigger only on the leftmost source, raw_data.books)
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server kafka:19092 --topic authors <<EOF
+{"id": 10, "name": "Frank Herbert"}
+EOF
+
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server kafka:19092 --topic books <<EOF
+{"id": 1, "author_id": 10, "title": "Dune",         "price": 15.99, "stock_quantity": 42}
+{"id": 2, "author_id": 10, "title": "Dune Messiah", "price": 12.50, "stock_quantity": 17}
+EOF
+
+# events — unrelated to the book domain, just the simplest pipeline
 docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server kafka:19092 --topic events <<EOF
 {"id": 1, "msg": "hello", "ts": "2026-10-02 12:00:00.000000"}
 {"id": 2, "msg": "world", "ts": "2026-10-02 12:00:01.000000"}
 EOF
 
-docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-    --bootstrap-server kafka:19092 --topic books <<EOF
-{"id": 1, "title": "Dune", "author_id": 10, "published_year": 1965, "ts": "2026-10-02 12:00:00.000000"}
-EOF
+sleep 15   # let the materialized views flush
+```
 
-docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
-    --bootstrap-server kafka:19092 --topic authors <<EOF
-{"id": 10, "name": "Frank Herbert", "country": "US", "ts": "2026-10-02 12:00:00.000000"}
-EOF
+### 2. Check Iceberg row counts
 
-# Give the materialized views a moment to flush
-sleep 10
-
-# Read all three Iceberg tables through the Polaris catalog
+```sh
 docker compose exec clickhouse clickhouse-client -q "
-SELECT 'events'  AS t, count() FROM polaris_catalog.\`default.events\`  UNION ALL
-SELECT 'books'   AS t, count() FROM polaris_catalog.\`default.books\`   UNION ALL
-SELECT 'authors' AS t, count() FROM polaris_catalog.\`default.authors\`
+SELECT 'default.events'       AS t, count() c FROM polaris_catalog.\`default.events\`       UNION ALL
+SELECT 'raw_data.books'       AS t, count() c FROM polaris_catalog.\`raw_data.books\`       UNION ALL
+SELECT 'raw_data.authors'     AS t, count() c FROM polaris_catalog.\`raw_data.authors\`     UNION ALL
+SELECT 'silver.books_authors' AS t, count() c FROM polaris_catalog.\`silver.books_authors\`
+ORDER BY t FORMAT PrettyCompact
 "
 ```
 
-Then open the RustFS console at <http://localhost:9001> (login
-`polaris_root` / `polaris_pass`) and browse the `warehouse` bucket. You should
-see Parquet data files under `default/events/data/` and Iceberg metadata under
-`default/events/metadata/`.
+Expect `2, 2, 1, 2` respectively.
+
+### 3. Inspect the silver JOIN output
+
+```sh
+docker compose exec clickhouse clickhouse-client -q "
+SELECT * FROM polaris_catalog.\`silver.books_authors\` ORDER BY id FORMAT PrettyCompact
+"
+```
+
+Expect two rows, each with `author_name = 'Frank Herbert'`.
+
+### 4. Confirm the silver → Kafka fan-out
+
+The silver MV has a sibling that writes the same JOIN result to the
+`book_authors` Kafka topic:
+
+```sh
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+    --bootstrap-server kafka:19092 --topic book_authors \
+    --from-beginning --timeout-ms 5000
+```
+
+Expect two JSON lines like
+`{"id":1,"author_name":"Frank Herbert","title":"Dune","price":15.99,"stock_quantity":42}`.
+The `TimeoutException` at the end is just the consumer exiting after the idle
+window — not an error.
+
+### 5. Confirm Parquet files landed in RustFS
+
+Open <http://localhost:9001> (login `polaris_root` / `polaris_pass`) and browse
+the `warehouse` bucket. Expect `data/*.parquet` + `metadata/*.{json,avro}`
+under each of `default/events/`, `raw_data/{books,authors}/`, and
+`silver/books_authors/`.
+
+Or via CLI:
+
+```sh
+docker compose exec -T polaris-setup sh -c '
+  apk add -q --no-cache aws-cli;
+  AWS_ACCESS_KEY_ID=polaris_root AWS_SECRET_ACCESS_KEY=polaris_pass \
+  AWS_DEFAULT_REGION=us-west-2 \
+    aws s3 ls s3://warehouse/ --recursive --endpoint-url http://rustfs:9900
+'
+```
 
 ## UIs & credentials
 
