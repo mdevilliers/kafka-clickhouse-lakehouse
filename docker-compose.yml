@@ -34,11 +34,28 @@ services:
       - -c
       - |
         set -e
-        echo "Creating topic 'events'..."
         /opt/kafka/bin/kafka-topics.sh \
           --bootstrap-server kafka:19092 \
           --create --if-not-exists \
           --topic events \
+          --partitions 1 \
+          --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:19092 \
+          --create --if-not-exists \
+          --topic books \
+          --partitions 1 \
+          --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:19092 \
+          --create --if-not-exists \
+          --topic authors \
+          --partitions 1 \
+          --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh \
+          --bootstrap-server kafka:19092 \
+          --create --if-not-exists \
+          --topic book_authors \
           --partitions 1 \
           --replication-factor 1
         echo "Topics now:"
@@ -150,6 +167,8 @@ services:
     depends_on:
       polaris:
         condition: service_healthy
+    volumes:
+      - ./schemas:/schemas:ro
     environment:
       - CLIENT_ID=${ROOT_CLIENT_ID:-root}
       - CLIENT_SECRET=${ROOT_CLIENT_SECRET:-s3cr3t}
@@ -247,35 +266,33 @@ services:
           -H "Content-Type: application/json" \
           -d '{"type": "catalog", "privilege": "CATALOG_MANAGE_CONTENT"}'
 
-        echo "Fetching user token to create Iceberg namespace + table..."
+        echo "Fetching user token to create Iceberg namespaces + tables..."
         USER_TOKEN=$$(curl -s -X POST http://polaris:8181/api/catalog/v1/oauth/tokens \
           -H 'Content-Type: application/x-www-form-urlencoded' \
           -d "grant_type=client_credentials&client_id=$${USER_CLIENT_ID}&client_secret=$${USER_CLIENT_SECRET}&scope=PRINCIPAL_ROLE:ALL" \
           | jq -r '.access_token')
 
-        echo "Creating namespace 'default'..."
-        curl -s -X POST http://polaris:8181/api/catalog/v1/$$CATALOG_NAME/namespaces \
-          -H "Authorization: Bearer $$USER_TOKEN" \
-          -H "Polaris-Realm: $$REALM" \
-          -H "Content-Type: application/json" \
-          -d '{"namespace": ["default"], "properties": {}}' || echo "(namespace may already exist)"
+        for f in /schemas/*.json; do
+          NS=$$(jq -r .namespace "$$f")
+          TBL=$$(jq -r .name "$$f")
 
-        echo "Creating Iceberg table 'default.events'..."
-        curl -s -X POST http://polaris:8181/api/catalog/v1/$$CATALOG_NAME/namespaces/default/tables \
-          -H "Authorization: Bearer $$USER_TOKEN" \
-          -H "Polaris-Realm: $$REALM" \
-          -H "Content-Type: application/json" \
-          -d '{
-            "name": "events",
-            "schema": {
-              "type": "struct",
-              "fields": [
-                {"id": 1, "name": "id",  "type": "long",      "required": false},
-                {"id": 2, "name": "msg", "type": "string",    "required": false},
-                {"id": 3, "name": "ts",  "type": "timestamp", "required": false}
-              ]
-            }
-          }' || echo "(table may already exist)"
+          echo "Ensuring namespace '$$NS'..."
+          curl -s -o /dev/null -w "  namespace $$NS -> HTTP %{http_code}\n" \
+            -X POST http://polaris:8181/api/catalog/v1/$$CATALOG_NAME/namespaces \
+            -H "Authorization: Bearer $$USER_TOKEN" \
+            -H "Polaris-Realm: $$REALM" \
+            -H "Content-Type: application/json" \
+            -d "{\"namespace\": [\"$$NS\"], \"properties\": {}}" || true
+
+          echo "Creating table '$$NS.$$TBL'..."
+          jq 'del(.namespace)' "$$f" | \
+            curl -s -o /dev/null -w "  table $$NS.$$TBL -> HTTP %{http_code}\n" \
+              -X POST http://polaris:8181/api/catalog/v1/$$CATALOG_NAME/namespaces/$$NS/tables \
+              -H "Authorization: Bearer $$USER_TOKEN" \
+              -H "Polaris-Realm: $$REALM" \
+              -H "Content-Type: application/json" \
+              -d @- || true
+        done
 
         echo ""
         echo "=========================================="

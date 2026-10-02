@@ -1,0 +1,11 @@
+{
+  "namespace": "raw_data",
+  "name": "authors",
+  "schema": {
+    "type": "struct",
+    "fields": [
+      {"id": 1, "name": "id",   "type": "long",   "required": false},
+      {"id": 2, "name": "name", "type": "string", "required": false}
+    ]
+  }
+}

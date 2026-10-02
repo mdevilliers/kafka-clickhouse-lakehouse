@@ -24,3 +24,4 @@ SETTINGS
 CREATE MATERIALIZED VIEW IF NOT EXISTS default.events_mv
 TO polaris_catalog.`default.events` AS
 SELECT id, msg, ts FROM default.events_kafka;
+

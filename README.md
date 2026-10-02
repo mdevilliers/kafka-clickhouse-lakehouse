@@ -5,6 +5,53 @@ Polaris REST catalog) → RustFS (S3-compatible). Keycloak is wired in as an OID
 provider for human/UI auth; ClickHouse talks to Polaris with internal
 client-credentials.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph host["host"]
+        user(["user / producer"])
+        browser(["browser"])
+    end
+
+    subgraph stack["docker-compose network"]
+        kafka[["kafka<br/>KRaft, :9092"]]
+        ch[["clickhouse 26.9<br/>:8123 / :9000"]]
+        polaris[["polaris<br/>Iceberg REST, :8181"]]
+        console[["polaris-console<br/>:4000"]]
+        keycloak[["keycloak<br/>OIDC, :8080"]]
+        rustfs[("rustfs<br/>S3, :9900<br/>bucket: warehouse")]
+    end
+
+    schemas[/"schemas/*.json<br/>(source of truth)"/]
+    schemas -- "polaris-setup<br/>loop → create tables" --> polaris
+
+    user -- "JSON msgs<br/>topics: events, books, authors" --> kafka
+    kafka -- "Kafka Engine<br/>{events,books,authors}_kafka" --> ch
+    ch -- "MVs<br/>INSERT via DataLakeCatalog" --> polaris
+    ch -- "write Parquet + Iceberg metadata" --> rustfs
+    polaris -- "register snapshot<br/>s3://warehouse/default/{events,books,authors}/" --> rustfs
+
+    browser -- "/" --> console
+    console -. "Login with OIDC" .-> keycloak
+    keycloak -. "id_token<br/>principal_name=polaris" .-> console
+    console -- "catalog + mgmt APIs<br/>Bearer id_token" --> polaris
+
+    ch -. "OAuth2 client_credentials<br/>quickstart_user" .-> polaris
+
+    classDef store fill:#eef,stroke:#558,stroke-width:1px
+    classDef auth fill:#fee,stroke:#855,stroke-width:1px
+    class rustfs store
+    class keycloak auth
+```
+
+**Two auth paths into Polaris** — intentional:
+- **Machine (ClickHouse)**: Polaris's own OAuth2 client-credentials. Fast,
+  stateless, no browser.
+- **Human (Polaris Console)**: OIDC via Keycloak, PKCE flow. Token's
+  `principal_name=polaris` claim maps to a Polaris principal with the same
+  catalog grants.
+
 ## Services
 
 | Service     | Image                            | Host port(s)   |
@@ -18,12 +65,13 @@ client-credentials.
 
 One-shot init containers:
 - `bucket-setup` — creates the `warehouse` bucket in RustFS
-- `kafka-topic-setup` — creates the `events` topic
-- `polaris-setup` — bootstraps the catalog, principal, role, privileges, the
-  `default` Iceberg namespace, and the `default.events` Iceberg table (via
+- `kafka-topic-setup` — creates topics `events`, `books`, `authors`
+- `polaris-setup` — bootstraps the catalog, principal, role, privileges, then
+  **loops over `schemas/*.json`** to create each Iceberg namespace + table (via
   Polaris's Iceberg REST API — ClickHouse 26.9 can `INSERT` and `SELECT`
   through a `DataLakeCatalog` database but can't yet `CREATE TABLE` through
-  it, so we pre-create the table catalog-side)
+  it, so we pre-create tables catalog-side). Polaris is the single source of
+  truth for Iceberg schemas.
 
 ## Quick start
 
@@ -36,27 +84,70 @@ On first boot, ClickHouse automatically runs
 `clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql`, which creates:
 
 - Database `polaris_catalog` (DataLakeCatalog engine → Polaris REST)
-- Table `default.events_kafka` (Kafka Engine, consumes topic `events`)
-- Materialized view `default.events_mv` wiring Kafka → `polaris_catalog.\`default.events\``
+- Kafka Engine source tables `default.{events,books,authors}_kafka`
+- Materialized views `default.{events,books,authors}_mv` wiring each Kafka topic
+  to `polaris_catalog.\`default.{events,books,authors}\``
 
-The Iceberg target table itself is pre-created by `polaris-setup`.
+The Iceberg target tables themselves are pre-created by `polaris-setup` from
+the JSON files in [schemas/](schemas/).
+
+## Adding an Iceberg table
+
+Three mechanical edits, no inline JSON:
+
+1. **Add a Kafka topic** — a line in `kafka-topic-setup` in
+   [docker-compose.yml](docker-compose.yml).
+2. **Drop a schema file** — new `schemas/<name>.json` with Iceberg field
+   types (`long`, `string`, `int`, `timestamp`, …). The `namespace` and `name`
+   fields at the top become the Polaris namespace + table name.
+3. **Add a Kafka Engine + MV block** to
+   [clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql](clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql).
+   Column names and types must match the Iceberg schema from step 2.
+
+### Applying to a running stack
+
+The CH init SQL only runs on first boot (empty data dir). To apply changes
+to a running stack:
+
+```sh
+# 1. Re-run the Polaris schema loop (idempotent — unchanged schemas are no-ops)
+docker compose rm -sf polaris-setup && docker compose up -d polaris-setup
+
+# 2. Re-run the ClickHouse DDL by hand
+docker compose exec -T clickhouse clickhouse-client --multiquery \
+    < clickhouse/docker-entrypoint-initdb.d/01-polaris-catalog.sql
+```
+
+Both are `IF NOT EXISTS` / idempotent, so re-running is safe.
 
 ## End-to-end verification
 
 ```sh
-# Produce two JSON messages
-docker compose exec kafka /opt/kafka/bin/kafka-console-producer.sh \
+# Produce to all three topics (-T disables TTY so heredoc works)
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
     --bootstrap-server kafka:19092 --topic events <<EOF
-{"id": 1, "msg": "hello", "ts": "2026-10-01 12:00:00.000000"}
-{"id": 2, "msg": "world", "ts": "2026-10-01 12:00:01.000000"}
+{"id": 1, "msg": "hello", "ts": "2026-10-02 12:00:00.000000"}
+{"id": 2, "msg": "world", "ts": "2026-10-02 12:00:01.000000"}
 EOF
 
-# Give the materialized view a moment to flush
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server kafka:19092 --topic books <<EOF
+{"id": 1, "title": "Dune", "author_id": 10, "published_year": 1965, "ts": "2026-10-02 12:00:00.000000"}
+EOF
+
+docker compose exec -T kafka /opt/kafka/bin/kafka-console-producer.sh \
+    --bootstrap-server kafka:19092 --topic authors <<EOF
+{"id": 10, "name": "Frank Herbert", "country": "US", "ts": "2026-10-02 12:00:00.000000"}
+EOF
+
+# Give the materialized views a moment to flush
 sleep 10
 
-# Read from the Iceberg table in the Polaris catalog
+# Read all three Iceberg tables through the Polaris catalog
 docker compose exec clickhouse clickhouse-client -q "
-SELECT count(), max(ts) FROM polaris_catalog.\`default.events\`;
+SELECT 'events'  AS t, count() FROM polaris_catalog.\`default.events\`  UNION ALL
+SELECT 'books'   AS t, count() FROM polaris_catalog.\`default.books\`   UNION ALL
+SELECT 'authors' AS t, count() FROM polaris_catalog.\`default.authors\`
 "
 ```
 

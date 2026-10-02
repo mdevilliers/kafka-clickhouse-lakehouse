@@ -1,0 +1,14 @@
+{
+  "namespace": "raw_data",
+  "name": "books",
+  "schema": {
+    "type": "struct",
+    "fields": [
+      {"id": 1, "name": "id",             "type": "long",   "required": false},
+      {"id": 2, "name": "author_id",      "type": "long",   "required": false},
+      {"id": 3, "name": "title",          "type": "string", "required": false},
+      {"id": 4, "name": "price",          "type": "double", "required": false},
+      {"id": 5, "name": "stock_quantity", "type": "int",    "required": false}
+    ]
+  }
+}

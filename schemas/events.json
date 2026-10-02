@@ -1,0 +1,12 @@
+{
+  "namespace": "default",
+  "name": "events",
+  "schema": {
+    "type": "struct",
+    "fields": [
+      {"id": 1, "name": "id",  "type": "long",      "required": false},
+      {"id": 2, "name": "msg", "type": "string",    "required": false},
+      {"id": 3, "name": "ts",  "type": "timestamp", "required": false}
+    ]
+  }
+}
