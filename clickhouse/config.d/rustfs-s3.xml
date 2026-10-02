@@ -1,0 +1,10 @@
+<clickhouse>
+    <s3>
+        <warehouse>
+            <endpoint>http://rustfs:9900/warehouse</endpoint>
+            <access_key_id>polaris_root</access_key_id>
+            <secret_access_key>polaris_pass</secret_access_key>
+            <region>us-west-2</region>
+        </warehouse>
+    </s3>
+</clickhouse>
